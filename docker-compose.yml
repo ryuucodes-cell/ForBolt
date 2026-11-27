@@ -1,24 +1,21 @@
 services:
-  # ── Telegram Bot (Python) ───────────────────────────────────────
+  # ── Telegram Bot + API server (Python) ──────────────────────────
   bot:
     build: .
     container_name: stockbot
     restart: unless-stopped
     env_file: .env
     environment:
-      - CONTAINER_NAME=stockbot
       - TZ=Asia/Yangon
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
-    group_add:
-      - "${DOCKER_GID:-999}"
+      - shop-data:/app/data
+    ports:
+      - "5000:5000"
     logging:
       driver: "json-file"
       options:
         max-size: "10m"
         max-file: "3"
-    depends_on:
-      - webapp
 
   # ── Web App (Telegram Mini App, served via nginx) ──────────────
   webapp:
@@ -27,8 +24,13 @@ services:
     restart: unless-stopped
     ports:
       - "8080:80"
+    depends_on:
+      - bot
     logging:
       driver: "json-file"
       options:
         max-size: "10m"
         max-file: "3"
+
+volumes:
+  shop-data:

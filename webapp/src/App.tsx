@@ -1,5 +1,5 @@
 import { useState, useEffect, useCallback } from 'react'
-import { supabase } from './supabase'
+import { apiGet, apiPost } from './api'
 import type { Product, Config, Order, Deposit, Giveaway, LdRound } from './types'
 
 type Tab = 'shop' | 'wallet' | 'orders' | 'deposits' | 'giveaway' | 'lucky'
@@ -26,7 +26,6 @@ declare global {
 function tgUser(): { id: number; username: string } {
   const u = window.Telegram?.WebApp?.initDataUnsafe?.user
   if (u) return { id: u.id, username: u.username || '' }
-  // fallback for dev/testing without Telegram
   return { id: 12345, username: 'devuser' }
 }
 
@@ -63,21 +62,18 @@ export default function App() {
   }
 
   const loadConfig = useCallback(async () => {
-    const { data, error } = await supabase.from('config').select('key, value')
-    if (error || !data) return
-    const cfg: Config = {} as Config
-    for (const row of data) cfg[row.key] = row.value
-    setConfig(cfg)
+    try {
+      const data = await apiGet('/api/config')
+      setConfig(data as Config)
+    } catch { /* ignore */ }
   }, [])
 
   const loadBalance = useCallback(async () => {
-    const { data } = await supabase
-      .from('users')
-      .select('mmk_balance')
-      .eq('telegram_id', tg.id)
-      .maybeSingle()
-    setBalance(data?.mmk_balance || 0)
-  }, [tg.id])
+    try {
+      const data = await apiGet(`/api/user/${tg.id}?username=${encodeURIComponent(tg.username)}`)
+      setBalance(data.mmk_balance || 0)
+    } catch { /* ignore */ }
+  }, [tg.id, tg.username])
 
   useEffect(() => {
     (async () => {
@@ -151,44 +147,26 @@ function ShopTab({ tg, config, onBalanceChange, showToast }: {
   showToast: (msg: string, type?: 'success' | 'error') => void
 }) {
   const [products, setProducts] = useState<Product[]>([])
-  const [stockMap, setStockMap] = useState<Record<number, number>>({})
   const [category, setCategory] = useState('')
   const [categories, setCategories] = useState<string[]>([])
   const [selected, setSelected] = useState<Product | null>(null)
   const [loading, setLoading] = useState(true)
 
   const loadProducts = useCallback(async () => {
-    const { data, error } = await supabase
-      .from('products')
-      .select('*')
-      .eq('active', 1)
-      .order('name', { ascending: true })
-
-    if (error || !data) {
+    try {
+      const data = await apiGet('/api/products')
+      const prods = data.map((p: any) => ({
+        ...p,
+        active: 1,
+        credential_format: '',
+        reseller_price_mmk: null,
+      })) as Product[]
+      setProducts(prods)
+      const cats = [...new Set(prods.map(p => p.category).filter(Boolean))]
+      setCategories(cats)
+    } catch {
       showToast('Failed to load products', 'error')
-      return
     }
-
-    const prods = data as Product[]
-    setProducts(prods)
-
-    // load stock counts
-    const { data: stockData } = await supabase
-      .from('stock')
-      .select('product_id')
-      .is('reserved_for', null)
-
-    const counts: Record<number, number> = {}
-    if (stockData) {
-      for (const row of stockData) {
-        counts[row.product_id] = (counts[row.product_id] || 0) + 1
-      }
-    }
-    setStockMap(counts)
-
-    const cats = [...new Set(prods.map(p => p.category).filter(Boolean))]
-    setCategories(cats)
-
     setLoading(false)
   }, [showToast])
 
@@ -202,7 +180,7 @@ function ShopTab({ tg, config, onBalanceChange, showToast }: {
     return (
       <ProductDetail
         product={selected}
-        stock={stockMap[selected.product_id] || 0}
+        stock={(selected as any).stock || 0}
         tg={tg}
         onBack={() => setSelected(null)}
         onBalanceChange={onBalanceChange}
@@ -236,11 +214,9 @@ function ShopTab({ tg, config, onBalanceChange, showToast }: {
       ) : (
         <div className="product-grid">
           {filtered.map(p => {
-            const stock = stockMap[p.product_id] || 0
+            const stock = (p as any).stock || 0
             const hasDiscount = p.discount_pct > 0
-            const discountedPrice = hasDiscount
-              ? Math.max(1, Math.floor(p.price_mmk * (100 - p.discount_pct) / 100))
-              : p.price_mmk
+            const discountedPrice = (p as any).effective_price || p.price_mmk
             return (
               <div key={p.product_id} className="product-card" onClick={() => setSelected(p)}>
                 <div className={`pc-stock ${stock === 0 ? 'out' : stock <= threshold ? 'low' : 'in'}`}>
@@ -274,9 +250,7 @@ function ProductDetail({ product, stock, tg, onBack, onBalanceChange, showToast 
   const [qty, setQty] = useState(1)
 
   const hasDiscount = product.discount_pct > 0
-  const discountedPrice = hasDiscount
-    ? Math.max(1, Math.floor(product.price_mmk * (100 - product.discount_pct) / 100))
-    : product.price_mmk
+  const discountedPrice = (product as any).effective_price || product.price_mmk
   const total = discountedPrice * qty
   const isPreorder = product.fulfillment === 'preorder'
   const lowThreshold = 3
@@ -287,107 +261,23 @@ function ProductDetail({ product, stock, tg, onBack, onBalanceChange, showToast 
       return
     }
     setBuying(true)
-
-    // Ensure user exists
-    await supabase
-      .from('users')
-      .upsert({ telegram_id: tg.id, username: tg.username })
-
-    if (isPreorder) {
-      // Create pre-order via RPC-like approach: deduct balance + create order
-      const { data: user } = await supabase
-        .from('users')
-        .select('mmk_balance')
-        .eq('telegram_id', tg.id)
-        .maybeSingle()
-
-      if (!user || user.mmk_balance < total) {
-        showToast('Insufficient balance — please top up your wallet', 'error')
-        setBuying(false)
-        return
+    try {
+      const result = await apiPost('/api/purchase', {
+        telegram_id: tg.id,
+        username: tg.username,
+        product_id: product.product_id,
+        qty,
+      })
+      if (result.error) {
+        showToast(result.error === 'insufficient' ? 'Insufficient balance — please top up' : result.error, 'error')
+      } else if (result.ok === false) {
+        showToast(result.reason === 'out_of_stock' ? 'Out of stock' : 'Insufficient balance', 'error')
+      } else {
+        showToast(`Purchase successful! ${qty} item(s) delivered.`)
       }
-
-      const { error: orderErr } = await supabase
-        .from('orders')
-        .insert({
-          telegram_id: tg.id,
-          username: tg.username,
-          product_id: product.product_id,
-          product_name: product.name,
-          amount_mmk: total,
-          payment_method: 'balance',
-          credential: '',
-          status: 'awaiting_fulfillment',
-          fulfillment_mode: 'preorder',
-        })
-
-      if (orderErr) {
-        showToast('Order failed — please try again', 'error')
-        setBuying(false)
-        return
-      }
-
-      await supabase
-        .from('users')
-        .update({ mmk_balance: user.mmk_balance - total, total_spent: 0 })
-        .eq('telegram_id', tg.id)
-
-      showToast('Pre-order placed! Admin will fulfill it soon.')
-    } else {
-      // Instant purchase
-      const { data: user } = await supabase
-        .from('users')
-        .select('mmk_balance')
-        .eq('telegram_id', tg.id)
-        .maybeSingle()
-
-      if (!user || user.mmk_balance < total) {
-        showToast('Insufficient balance — please top up your wallet', 'error')
-        setBuying(false)
-        return
-      }
-
-      // Claim stock items
-      const { data: stockItems } = await supabase
-        .from('stock')
-        .select('stock_id, credential')
-        .eq('product_id', product.product_id)
-        .is('reserved_for', null)
-        .limit(qty)
-
-      if (!stockItems || stockItems.length < qty) {
-        showToast('Not enough stock available', 'error')
-        setBuying(false)
-        return
-      }
-
-      // Delete claimed stock
-      const stockIds = stockItems.map(s => s.stock_id)
-      await supabase.from('stock').delete().in('stock_id', stockIds)
-
-      // Create orders
-      for (const item of stockItems) {
-        await supabase.from('orders').insert({
-          telegram_id: tg.id,
-          username: tg.username,
-          product_id: product.product_id,
-          product_name: product.name,
-          amount_mmk: discountedPrice,
-          payment_method: 'balance',
-          credential: item.credential,
-          status: 'completed',
-        })
-      }
-
-      // Deduct balance
-      await supabase
-        .from('users')
-        .update({ mmk_balance: user.mmk_balance - total })
-        .eq('telegram_id', tg.id)
-
-      showToast(`Purchase successful! ${qty} item(s) delivered.`)
+    } catch {
+      showToast('Purchase failed — please try again', 'error')
     }
-
     onBalanceChange()
     setBuying(false)
     onBack()
@@ -459,14 +349,12 @@ function WalletTab({ tg, balance, onBalanceChange, showToast }: {
 
   useEffect(() => {
     (async () => {
-      const { data } = await supabase
-        .from('users')
-        .select('total_spent, bonus_earned, is_reseller')
-        .eq('telegram_id', tg.id)
-        .maybeSingle()
-      setUser(data as any)
+      try {
+        const data = await apiGet(`/api/user/${tg.id}?username=${encodeURIComponent(tg.username)}`)
+        setUser(data)
+      } catch { /* ignore */ }
     })()
-  }, [tg.id])
+  }, [tg.id, tg.username])
 
   return (
     <>
@@ -526,13 +414,10 @@ function OrdersTab({ tg, showToast }: {
   const [loading, setLoading] = useState(true)
 
   const load = useCallback(async () => {
-    const { data } = await supabase
-      .from('orders')
-      .select('*')
-      .eq('telegram_id', tg.id)
-      .order('created_at', { ascending: false })
-      .limit(50)
-    setOrders((data || []) as Order[])
+    try {
+      const data = await apiGet(`/api/orders/${tg.id}`)
+      setOrders(data as Order[])
+    } catch { /* ignore */ }
     setLoading(false)
   }, [tg.id])
 
@@ -597,13 +482,10 @@ function DepositsTab({ tg, showToast }: {
 
   useEffect(() => {
     (async () => {
-      const { data } = await supabase
-        .from('deposits')
-        .select('*')
-        .eq('telegram_id', tg.id)
-        .order('created_at', { ascending: false })
-        .limit(50)
-      setDeposits((data || []) as Deposit[])
+      try {
+        const data = await apiGet(`/api/deposits/${tg.id}`)
+        setDeposits(data as Deposit[])
+      } catch { /* ignore */ }
       setLoading(false)
     })()
   }, [tg.id])
@@ -656,12 +538,10 @@ function GiveawayTab({ tg, showToast }: {
 
   useEffect(() => {
     (async () => {
-      const { data } = await supabase
-        .from('giveaways')
-        .select('*')
-        .order('created_at', { ascending: false })
-        .limit(20)
-      setGiveaways((data || []) as Giveaway[])
+      try {
+        const data = await apiGet('/api/giveaways')
+        setGiveaways(data as Giveaway[])
+      } catch { /* ignore */ }
       setLoading(false)
     })()
   }, [])
@@ -710,17 +590,15 @@ function LuckyDrawTab({ tg, onBalanceChange, showToast }: {
   onBalanceChange: () => void
   showToast: (msg: string, type?: 'success' | 'error') => void
 }) {
-  const [rounds, setRounds] = useState<LdRound[]>([])
+  const [rounds, setRounds] = useState<(LdRound & { entries: { slot_no: number; telegram_id: number }[] })[]>([])
   const [loading, setLoading] = useState(true)
   const [buying, setBuying] = useState<number | null>(null)
 
   const load = useCallback(async () => {
-    const { data } = await supabase
-      .from('ld_rounds')
-      .select('*')
-      .order('round_id', { ascending: false })
-      .limit(20)
-    setRounds((data || []) as LdRound[])
+    try {
+      const data = await apiGet('/api/ld_rounds')
+      setRounds(data)
+    } catch { /* ignore */ }
     setLoading(false)
   }, [])
 
@@ -728,56 +606,26 @@ function LuckyDrawTab({ tg, onBalanceChange, showToast }: {
 
   const handleBuySlot = async (round: LdRound) => {
     setBuying(round.round_id)
-
-    const { data: user } = await supabase
-      .from('users')
-      .select('mmk_balance')
-      .eq('telegram_id', tg.id)
-      .maybeSingle()
-
-    if (!user || user.mmk_balance < round.entry_price) {
-      showToast('Insufficient balance', 'error')
-      setBuying(null)
-      return
-    }
-
-    // Count current entries
-    const { count } = await supabase
-      .from('ld_entries')
-      .select('*', { count: 'exact', head: true })
-      .eq('round_id', round.round_id)
-
-    if (count !== null && count >= round.total_slots) {
-      showToast('All slots are full', 'error')
-      setBuying(null)
-      return
-    }
-
-    const slotNo = (count || 0) + 1
-
-    // Insert entry
-    const { error } = await supabase
-      .from('ld_entries')
-      .insert({
-        round_id: round.round_id,
+    try {
+      const result = await apiPost('/api/ld_buy_slot', {
         telegram_id: tg.id,
         username: tg.username,
-        slot_no: slotNo,
+        round_id: round.round_id,
       })
-
-    if (error) {
+      if (result.error) {
+        const msgs: Record<string, string> = {
+          insufficient: 'Insufficient balance',
+          full: 'All slots are full',
+          closed: 'This round is closed',
+          cap: 'You have reached the max slots for this round',
+        }
+        showToast(msgs[result.error] || result.error, 'error')
+      } else if (result.ok) {
+        showToast(`Slot #${result.slot_no} purchased!`)
+      }
+    } catch {
       showToast('Failed to buy slot', 'error')
-      setBuying(null)
-      return
     }
-
-    // Deduct balance
-    await supabase
-      .from('users')
-      .update({ mmk_balance: user.mmk_balance - round.entry_price })
-      .eq('telegram_id', tg.id)
-
-    showToast(`Slot #${slotNo} purchased!`)
     onBalanceChange()
     setBuying(null)
     load()
@@ -796,71 +644,54 @@ function LuckyDrawTab({ tg, onBalanceChange, showToast }: {
 
   return (
     <>
-      {rounds.map(r => (
-        <div key={r.round_id} className="ld-card">
-          <div className="ld-title">{r.product_name}</div>
-          <div className="li-sub">Entry: <span style={{ color: 'var(--accent)', fontWeight: 700 }}>{fmtMMK(r.entry_price)}</span></div>
-          <div className="li-sub" style={{ marginTop: 4 }}>
-            {r.total_slots} slots · Ends {fmtDate(r.deadline)}
-          </div>
+      {rounds.map(r => {
+        const entries = r.entries || []
+        const filledMap = new Map(entries.map(e => [e.slot_no, e.telegram_id]))
+        const displaySlots = Math.min(r.total_slots, 50)
 
-          {/* Slots visualization */}
-          <LdSlots roundId={r.round_id} totalSlots={r.total_slots} tgId={tg.id} />
-
-          <div className="li-row" style={{ marginTop: 6 }}>
-            <span className={`badge ${
-              r.status === 'open' ? 'badge-success' :
-              r.status === 'completed' ? 'badge-info' :
-              'badge-muted'
-            }`}>{r.status}</span>
-          </div>
-
-          {r.status === 'open' && (
-            <button
-              className="btn btn-primary"
-              style={{ marginTop: 12 }}
-              disabled={buying === r.round_id}
-              onClick={() => handleBuySlot(r)}
-            >
-              {buying === r.round_id ? 'Processing...' : `Buy Slot — ${fmtMMK(r.entry_price)}`}
-            </button>
-          )}
-        </div>
-      ))}
-    </>
-  )
-}
-
-function LdSlots({ roundId, totalSlots, tgId }: { roundId: number; totalSlots: number; tgId: number }) {
-  const [entries, setEntries] = useState<{ slot_no: number; telegram_id: number }[]>([])
-
-  useEffect(() => {
-    (async () => {
-      const { data } = await supabase
-        .from('ld_entries')
-        .select('slot_no, telegram_id')
-        .eq('round_id', roundId)
-        .order('slot_no')
-      setEntries(data || [])
-    })()
-  }, [roundId])
-
-  const filledMap = new Map(entries.map(e => [e.slot_no, e.telegram_id]))
-  const displaySlots = Math.min(totalSlots, 50)
-
-  return (
-    <div className="ld-slots">
-      {Array.from({ length: displaySlots }, (_, i) => {
-        const slotNo = i + 1
-        const filledBy = filledMap.get(slotNo)
-        const isMine = filledBy === tgId
         return (
-          <div
-            key={slotNo}
-            className={`ld-slot ${filledBy ? 'filled' : ''} ${isMine ? 'mine' : ''}`}
-          >{slotNo}</div>
+          <div key={r.round_id} className="ld-card">
+            <div className="ld-title">{r.product_name}</div>
+            <div className="li-sub">Entry: <span style={{ color: 'var(--accent)', fontWeight: 700 }}>{fmtMMK(r.entry_price)}</span></div>
+            <div className="li-sub" style={{ marginTop: 4 }}>
+              {r.total_slots} slots · Ends {fmtDate(r.deadline)}
+            </div>
+
+            <div className="ld-slots">
+              {Array.from({ length: displaySlots }, (_, i) => {
+                const slotNo = i + 1
+                const filledBy = filledMap.get(slotNo)
+                const isMine = filledBy === tg.id
+                return (
+                  <div
+                    key={slotNo}
+                    className={`ld-slot ${filledBy ? 'filled' : ''} ${isMine ? 'mine' : ''}`}
+                  >{slotNo}</div>
+                )
+              })}
+            </div>
+
+            <div className="li-row" style={{ marginTop: 6 }}>
+              <span className={`badge ${
+                r.status === 'open' ? 'badge-success' :
+                r.status === 'completed' ? 'badge-info' :
+                'badge-muted'
+              }`}>{r.status}</span>
+            </div>
+
+            {r.status === 'open' && (
+              <button
+                className="btn btn-primary"
+                style={{ marginTop: 12 }}
+                disabled={buying === r.round_id}
+                onClick={() => handleBuySlot(r)}
+              >
+                {buying === r.round_id ? 'Processing...' : `Buy Slot — ${fmtMMK(r.entry_price)}`}
+              </button>
+            )}
+          </div>
         )
       })}
-    </div>
+    </>
   )
 }

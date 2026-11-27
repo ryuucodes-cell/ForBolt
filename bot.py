@@ -31,6 +31,7 @@ import cdk_redeem
 import gifts
 import am_pro
 import pricelist
+import api
 
 # ── logging setup ─────────────────────────────────────────────────────────────
 
@@ -150,17 +151,25 @@ pricelist.register(bot)
 # ── background threads ────────────────────────────────────────────────────────
 
 def _auto_backup_loop():
-    """Supabase handles backups automatically — this loop is now a no-op
-    that just logs a heartbeat once a day so we know the background thread
-    is alive. The daily SQLite VACUUM+send was removed when we moved to Postgres."""
+    """Daily SQLite VACUUM to keep the database file compact.
+    The database file lives in /app/data (a Docker volume) so it persists
+    across restarts."""
     while True:
         time.sleep(3600)
         try:
             now = datetime.now()
             if now.hour == 0:
-                log.info("Daily heartbeat: Supabase manages database backups automatically")
+                db_vacuum()
+                log.info("Daily SQLite VACUUM completed")
         except Exception as e:
             log.error(f"Backup loop error: {e}")
+
+def db_vacuum():
+    """Run VACUUM on the SQLite database to compact the file."""
+    import sqlite3
+    conn = sqlite3.connect(db.DB_PATH)
+    conn.execute("VACUUM")
+    conn.close()
 
 def _discount_expiry_loop():
     """Every 60 seconds: clear expired discounts/stale states, send giveaway
@@ -327,6 +336,11 @@ if __name__ == "__main__":
 
     t_backup = threading.Thread(target=_auto_backup_loop, daemon=True)
     t_backup.start()
+
+    # Start the Flask API server for the web app in a background thread
+    t_api = threading.Thread(target=api.start_api_server, kwargs={"port": 5000}, daemon=True)
+    t_api.start()
+    log.info("API server started on port 5000")
 
     t_reseller = threading.Thread(target=_reseller_inactivity_loop, daemon=True)
     t_reseller.start()

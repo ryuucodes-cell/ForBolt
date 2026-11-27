@@ -5,7 +5,7 @@ This project has two frontends that share one database:
 1. **Telegram Bot** (Python) — the chat-based shop with admin panel
 2. **Telegram Mini App** (web app) — a mobile-friendly shop UI that opens inside Telegram
 
-Both connect to the same **Supabase** (Postgres) database, so users see the same products, balance, orders, and deposits regardless of which one they use.
+Both use the same **SQLite database file** — no external database server, no subscription, completely free. The database file lives in a Docker volume so it persists across restarts.
 
 ---
 
@@ -13,8 +13,9 @@ Both connect to the same **Supabase** (Postgres) database, so users see the same
 
 ```
 project/
-├── bot.py              # Bot entry point — starts polling + background threads
-├── db.py               # Database layer (Postgres via psycopg2)
+├── bot.py              # Bot entry point — starts polling + API server + background threads
+├── api.py              # Flask API server (serves web app data from the same SQLite DB)
+├── db.py               # Database layer (SQLite — file-based, no server needed)
 ├── handlers.py         # Bot customer-facing handlers (shop, buy, wallet, etc.)
 ├── admin.py            # Admin panel entry
 ├── admin_*.py          # Admin sub-modules (products, deposits, orders, etc.)
@@ -43,7 +44,7 @@ project/
     └── src/
         ├── main.tsx
         ├── App.tsx       # Main app (shop, wallet, orders, deposits, giveaways, lucky draw)
-        ├── supabase.ts   # Supabase client
+        ├── api.ts        # API client (fetches from the bot's Flask server)
         ├── types.ts      # TypeScript types
         └── index.css     # Styles
 ```
@@ -55,31 +56,18 @@ project/
 - **Docker** and **Docker Compose** installed on your server
 - A **Telegram Bot Token** (from [@BotFather](https://t.me/BotFather))
 - Your **Telegram user ID** (numeric — message [@userinfobot](https://t.me/userinfobot) to get it)
-- Your **Supabase database password** (set when the project was provisioned)
+
+That's it — no database server, no external services, no subscriptions.
 
 ---
 
 ## Step 1: Configure Environment Variables
 
-Open `.env` and fill in the missing values:
-
-### Required for the bot:
+Open `.env` and fill in:
 
 ```
 TELEGRAM_BOT_TOKEN=123456789:ABCdefGhiJklMnoPqrStuVwxYz
 ADMIN_CHAT_ID=123456789
-```
-
-### Required: Database connection string
-
-Find your Supabase database URL:
-1. Go to your Supabase Dashboard → **Settings** → **Database**
-2. Look for the **Connection string** section
-3. Copy the **URI** format (it looks like `postgresql://postgres.[project-ref]:[password]@aws-0-[region].pooler.supabase.com:6543/postgres`)
-4. Replace `YOUR_DB_PASSWORD` in `.env`:
-
-```
-SUPABASE_DB_URL=postgresql://postgres.kbnomuvdtgzoxcsqupqm:YOUR_ACTUAL_PASSWORD@aws-0-ap-southeast-1.pooler.supabase.com:6543/postgres
 ```
 
 ### Optional: Binance Pay (for auto-verified USDT deposits)
@@ -89,9 +77,7 @@ BINANCE_API_KEY=your_binance_api_key
 BINANCE_API_SECRET=your_binance_api_secret
 ```
 
-### Already configured (don't change):
-
-The `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY` values are pre-filled and used by the web app. The `SUPABASE_URL` and `SUPABASE_ANON_KEY` values are used by the bot.
+No database configuration is needed — SQLite creates the database file automatically on first run.
 
 ---
 
@@ -107,8 +93,10 @@ This starts two containers:
 
 | Container | What it does | Port |
 |-----------|-------------|------|
-| `stockbot` | Telegram bot (long polling) | — |
-| `stockbot-webapp` | Web app served by nginx | 8080 |
+| `stockbot` | Telegram bot (polling) + Flask API server | 5000 |
+| `stockbot-webapp` | Web app served by nginx (proxies /api to bot) | 8080 |
+
+The SQLite database file is stored in a Docker volume (`shop-data`) at `/app/data/shop.db` inside the bot container. It persists across restarts and updates.
 
 Check they're running:
 
@@ -195,6 +183,8 @@ pip install -r requirements.txt
 python bot.py
 ```
 
+This starts the bot and the API server (port 5000) together.
+
 ### Web App
 
 ```bash
@@ -203,16 +193,16 @@ npm install
 npm run dev
 ```
 
-The web app runs at `http://localhost:5173`. Open it in your browser to preview.
+The web app runs at `http://localhost:5173`. It will fetch data from `http://localhost:5000/api/...` — make sure the bot is running so the API is available.
 
 ---
 
 ## How the Two Frontends Share Data
 
-Both the bot and the web app connect to the same Supabase Postgres database:
+Both the bot and the web app use the same SQLite database file:
 
-- The **bot** uses a direct Postgres connection (via `psycopg2`) with the `SUPABASE_DB_URL` connection string. This gives it full access to all tables for money operations, stock management, and admin actions.
-- The **web app** uses the Supabase JavaScript client with the anon key. It reads products, displays orders/deposits, and lets users browse the shop. Money operations (purchases, deposits) go through the same database tables.
+- The **bot** reads and writes directly to the SQLite file for all operations (purchases, deposits, stock management, admin actions).
+- The **web app** makes HTTP requests to the bot's built-in Flask API server (port 5000), which reads from the same SQLite file. nginx proxies `/api/` requests from port 8080 to the bot's port 5000.
 
 When a user buys something through the bot, it instantly appears in the web app's order history. When a deposit is approved by the admin, the wallet balance updates in both places.
 
@@ -220,9 +210,12 @@ When a user buys something through the bot, it instantly appears in the web app'
 
 ## Database
 
-The database is hosted on **Supabase** and includes automatic daily backups and point-in-time recovery. You can manage backups from the Supabase Dashboard → Database → Backups.
+The database is a **SQLite file** at `/app/data/shop.db` (inside the Docker container). It's stored in a Docker volume so it survives container restarts and updates.
 
-All 21 tables (users, products, stock, orders, deposits, giveaways, gifts, lucky draw rounds, reseller keys, CDK activations, AM subscriptions, etc.) were created automatically when the project was provisioned.
+- **Backups**: Copy the `shop.db` file from the Docker volume. A daily VACUUM runs automatically to keep the file compact.
+- **Restore**: Replace the `shop.db` file and restart the container (`docker restart stockbot`).
+
+All 21 tables (users, products, stock, orders, deposits, giveaways, gifts, lucky draw rounds, reseller keys, CDK activations, AM subscriptions, etc.) are created automatically on first run.
 
 ---
 
@@ -231,17 +224,19 @@ All 21 tables (users, products, stock, orders, deposits, giveaways, gifts, lucky
 ### Bot won't start
 
 - Check `TELEGRAM_BOT_TOKEN` is set correctly in `.env`
-- Check `SUPABASE_DB_URL` has the correct password
 - Run `docker logs stockbot` to see the error
 
 ### Web app shows blank page
 
-- Make sure `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY` are set in `.env`
-- The web app reads these at build time — rebuild with `docker compose up --build -d`
+- Make sure the bot container is running (it serves the API)
+- Run `docker logs stockbot-webapp` to check nginx errors
+- Rebuild with `docker compose up --build -d`
 
 ### Web app can't load products
 
-- This usually means the Supabase anon key doesn't have access. The database tables have RLS policies that allow the anon key to read all data — verify these are in place via Supabase Dashboard → Authentication → Policies.
+- The API server runs inside the bot container on port 5000 — check it's running
+- Run `docker logs stockbot` and look for "API server started on port 5000"
+- Try `curl http://localhost:5000/api/products` to test the API directly
 
 ### Mini App button doesn't appear in Telegram
 
@@ -250,7 +245,7 @@ All 21 tables (users, products, stock, orders, deposits, giveaways, gifts, lucky
 
 ### Balance is different between bot and web app
 
-- Both read from the same database table (`users.mmk_balance`). If they differ, try refreshing the web app — the bot always has the authoritative value since it handles all money operations.
+- Both read from the same database file. If they differ, try refreshing the web app — the bot always has the authoritative value since it handles all money operations.
 
 ---
 
@@ -266,3 +261,5 @@ docker compose restart
 # Rebuild after code changes
 docker compose up --build -d
 ```
+
+The database file is preserved in the `shop-data` Docker volume when you stop or restart.

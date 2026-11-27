@@ -13,9 +13,14 @@ FROM nginx:alpine
 
 COPY --from=builder /app/dist /usr/share/nginx/html
 
-# SPA fallback — serve index.html for all routes
+# SPA fallback + API proxy to the bot's Flask server
 RUN echo 'server { \
   listen 80; \
+  location /api/ { \
+    proxy_pass http://bot:5000; \
+    proxy_set_header Host $host; \
+    proxy_set_header X-Real-IP $remote_addr; \
+  } \
   location / { \
     root /usr/share/nginx/html; \
     try_files $uri $uri/ /index.html; \
