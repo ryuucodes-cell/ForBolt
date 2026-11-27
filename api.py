@@ -6,13 +6,16 @@ SQLite database the bot uses. Started in a background thread by bot.py.
 """
 
 import logging
-from flask import Flask, jsonify, request
+import os
+from flask import Flask, jsonify, request, send_from_directory
 from flask_cors import CORS
 import db
 
 log = logging.getLogger("api")
 
-app = Flask(__name__)
+WEBAPP_DIST = os.path.join(os.path.dirname(os.path.abspath(__file__)), "webapp", "dist")
+
+app = Flask(__name__, static_folder=WEBAPP_DIST, static_url_path="")
 CORS(app)
 
 
@@ -160,6 +163,14 @@ def api_ld_buy_slot():
     db.ensure_user(tg_id, username)
     result = db.ld_buy_slot(round_id, tg_id, username)
     return jsonify(result)
+
+
+@app.route("/")
+@app.route("/<path:path>")
+def serve_webapp(path=""):
+    if path and os.path.isfile(os.path.join(WEBAPP_DIST, path)):
+        return send_from_directory(WEBAPP_DIST, path)
+    return send_from_directory(WEBAPP_DIST, "index.html")
 
 
 def start_api_server(host="0.0.0.0", port=5000):
