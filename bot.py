@@ -10,6 +10,7 @@ import threading
 import time
 
 import html as _html
+from datetime import datetime
 
 import telebot
 from telebot import apihelper
@@ -149,39 +150,17 @@ pricelist.register(bot)
 # ── background threads ────────────────────────────────────────────────────────
 
 def _auto_backup_loop():
-    """Send DB backup to admin every day at ~midnight server time."""
-    import sqlite3
-    from datetime import datetime
+    """Supabase handles backups automatically — this loop is now a no-op
+    that just logs a heartbeat once a day so we know the background thread
+    is alive. The daily SQLite VACUUM+send was removed when we moved to Postgres."""
     while True:
-        # sleep until next midnight check (check every hour)
         time.sleep(3600)
         try:
             now = datetime.now()
-            # fire between 00:00 and 01:00 server time
-            if now.hour != 0:
-                continue
-            aid = int(db.cfg_get("admin_chat_id", "0") or 0)
-            if not aid:
-                continue
-            ts = now.strftime("%Y%m%d_%H%M%S")
-            for src_path, fname, caption in [
-                (db.DB_PATH,      f"stockbot_{ts}.db",      "<b>Auto Backup — Main DB</b>"),
-                (db.DB_SOLD_PATH, f"stockbot_sold_{ts}.db", "<b>Auto Backup — Sold DB</b>"),
-            ]:
-                tmp = src_path + f".autobackup.tmp"
-                try:
-                    conn = sqlite3.connect(src_path)
-                    conn.execute(f"VACUUM INTO '{tmp}'")
-                    conn.close()
-                    with open(tmp, "rb") as f:
-                        bot.send_document(aid, f, visible_file_name=fname, caption=caption)
-                except Exception as e:
-                    log.error(f"Auto-backup failed for {src_path}: {e}")
-                finally:
-                    if os.path.exists(tmp):
-                        os.remove(tmp)
+            if now.hour == 0:
+                log.info("Daily heartbeat: Supabase manages database backups automatically")
         except Exception as e:
-            log.error(f"Auto-backup loop error: {e}")
+            log.error(f"Backup loop error: {e}")
 
 def _discount_expiry_loop():
     """Every 60 seconds: clear expired discounts/stale states, send giveaway

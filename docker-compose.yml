@@ -1,20 +1,32 @@
 services:
-  stockbot:
+  # ── Telegram Bot (Python) ───────────────────────────────────────
+  bot:
     build: .
     container_name: stockbot
     restart: unless-stopped
     env_file: .env
     environment:
       - CONTAINER_NAME=stockbot
-      # Myanmar local time for display-only timestamps (auto-backup schedule,
-      # user-facing ts() helper). DB timestamps are always UTC.
       - TZ=Asia/Yangon
     volumes:
-      - ./data:/app/data
       - /var/run/docker.sock:/var/run/docker.sock
     group_add:
       - "${DOCKER_GID:-999}"
-    # Cap container logs so they can never fill the disk (max ~30MB total).
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+    depends_on:
+      - webapp
+
+  # ── Web App (Telegram Mini App, served via nginx) ──────────────
+  webapp:
+    build: ./webapp
+    container_name: stockbot-webapp
+    restart: unless-stopped
+    ports:
+      - "8080:80"
     logging:
       driver: "json-file"
       options:
